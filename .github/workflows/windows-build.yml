@@ -1,0 +1,68 @@
+name: Windows app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python packaging/prepare_requirements.py "$env:RUNNER_TEMP/build-requirements.txt"
+          python -m pip install -r "$env:RUNNER_TEMP/build-requirements.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package app and bundled datasets
+        run: python -m PyInstaller --noconfirm packaging/windows.spec
+      - name: Test packaged app
+        shell: pwsh
+        run: |
+          $report = "$env:RUNNER_TEMP/ash-smoke.json"
+          $process = Start-Process -FilePath "dist/ASH-Toolset/ASH-Toolset.exe" -ArgumentList @('--smoke-test', '--smoke-output', $report) -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            throw 'Packaged app smoke test timed out'
+          }
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path $report) { Get-Content $report }
+            throw "Packaged app exited with $($process.ExitCode)"
+          }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if ($result.status -ne 'passed') { throw 'Smoke test did not pass' }
+          Get-Content $report
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Get-Content metadata.json -Raw | ConvertFrom-Json).version
+          & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" "/DAppVersion=$version" packaging/windows.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          # .NET ZipFile supports ZIP64 for the bundled datasets.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory("$pwd/dist/ASH-Toolset", "$pwd/artifacts/ASH-Toolset-Windows-portable.zip")
+          Copy-Item metadata.json artifacts/metadata.json
+          git rev-parse HEAD | Set-Content artifacts/commit.txt
+          Get-ChildItem artifacts/*.exe, artifacts/*.zip | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize | Out-String | Set-Content artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ASH-Toolset-Windows-${{ github.run_number }}
+          path: artifacts/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
